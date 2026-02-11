@@ -1,11 +1,12 @@
 /*
-* STAIGER O2-CONTROLLED PSV WITH PRESSURE MONITORING
+* STAIGER O2-CONTROLLED PSV WITH PRESSURE MONITORING (FIXED)
 * ---------------------------------------------------------
 * FEATURES:
 * 1. O2% input converted to flow (150*(O2%-21%)/(0.95-0.21))
 * 2. PSV breathing mode with dynamic flow control
 * 3. PTE7300 pressure sensor monitoring
 * 4. Combined telemetry output
+* 5. STABILITY FIX: Disables internal PID to prevent blinking on USB disconnect.
 * ---------------------------------------------------------
 */
 
@@ -36,6 +37,7 @@ const float FS_PSI = 5810.0f;   // match sensor full scale
 float currentPressure_PSI = 0.0f;  // global storage for latest pressure reading
 static const uint32_t PRESSURE_READ_PERIOD_MS = 100;  // Read pressure every 100ms
 bool sensorConnected = false;
+bool pressureReadingEnabled = true;  // Disable when solenoid is open
 
 // Pressure conversion function
 float dspToPsi(int16_t dsp) {
@@ -125,7 +127,7 @@ float o2PercentToFlow(float o2Percent) {
   if (o2Percent > 1.0) {
     o2Percent = o2Percent / 100.0;
   }
-  
+
   // Safety checks
   if (o2Percent < 0.21) {
     Serial.println("ERROR: O2% must be >= 21%");
@@ -135,28 +137,33 @@ float o2PercentToFlow(float o2Percent) {
     Serial.println("ERROR: O2% must be <= 95%");
     return 0;
   }
-  
+
   // Calculate flow using the formula
   float flow = 150.0 * (o2Percent - 0.21) / (0.95 - 0.21);
-  
+
   Serial.print(">> O2: "); Serial.print(o2Percent * 100, 1); 
   Serial.print("% -> Flow: "); Serial.print(flow, 1); Serial.println(" L/min");
-  
+
   return flow;
 }
 
 // ============================ PRESSURE SENSOR FUNCTIONS ============================
 void updatePressureSensor() {
   static uint32_t tPressure = 0;
-  
+
+  // Only read pressure sensor when enabled (solenoid closed)
+  if (!pressureReadingEnabled) {
+    return;
+  }
+
   // Read pressure sensor periodically
   if (millis() - tPressure > PRESSURE_READ_PERIOD_MS) {
     tPressure = millis();
-    
+
     if (sensorConnected && mySensor->isConnected()) {
       int16_t tempDSP = mySensor->readDSP_S();
-      // Only update if we got a valid reading (not zero)
-      if (tempDSP != 0) {
+      // Check if reading is within valid range (-16000 to +16000)
+      if (tempDSP >= -16384 && tempDSP <= 16384) {
         DSP_S = tempDSP;
         currentPressure_PSI = dspToPsi(DSP_S);
       }
@@ -173,6 +180,7 @@ void setTarget(float flow) {
     targetFlow = 0;
     integral = 0;
     setBoardCurrent(0);
+    pressureReadingEnabled = true;  // Re-enable pressure reading when solenoid closes
     Serial.println(">> STOPPED.");
     return;
   }
@@ -183,6 +191,7 @@ void setTarget(float flow) {
   integral = 0;
   targetFlow = flow;
   active = true;
+  pressureReadingEnabled = false;  // Disable pressure reading when solenoid opens
 }
 
 void startPSV(float maxFlow) {
@@ -193,6 +202,7 @@ void startPSV(float maxFlow) {
   active = true;
   integral = 0;
   lastPhase = -1;
+  pressureReadingEnabled = false;  // Disable pressure reading when solenoid opens
   setBoardCurrent(200.0); // Kick start
   delay(40);
 }
@@ -209,7 +219,7 @@ void updateControl() {
     unsigned long timeInCycle = (millis() - breathStartTime) % BREATH_PERIOD_MS;
 
     // DETECT NEW BREATH (Reset Integral)
-    int currentPhase = timeInCycle / 100;
+    int currentPhase = timeInCycle / 100; 
     if (currentPhase < lastPhase) {
        integral = 0; // CLEAN SLATE for the new breath!
     }
@@ -272,20 +282,20 @@ void setup() {
   // USB Serial for PC communication
   Serial.begin(115200);
   delay(1500);
-  
+
   // Serial1 for Staiger controller
   Serial1.begin(460800);
-  
+
   // I2C for pressure sensor
   Wire.begin();
   Wire.setClock(100000);
-  
+
   // Initialize pressure sensor
   mySensor = new PTE7300_I2C();
   mySensor->CRC(false); // use non-CRC address 0x6C
-  
+
   delay(100);
-  
+
   // Check if sensor is connected
   if (mySensor->isConnected()) {
     sensorConnected = true;
@@ -294,14 +304,26 @@ void setup() {
     sensorConnected = false;
     Serial.println("Pressure sensor: NOT DETECTED");
   }
-  
-  // Initialize Staiger controller
+
+  // Initialize Staiger controller local array
   for (uint8_t i = 0; i < VALUE_COUNT; i++) currentValues[i] = 0.0f;
-  
+
+  // ================= CRITICAL FIX: STOP BLINKING ON USB UNPLUG =================
+  // We disable the board's internal PID so it doesn't "freak out" when signal is lost.
+  sendCmd("F0:20000\n"); delay(10);
+  sendCmd("F1:20000\n"); delay(10);
+  sendCmd("F2:20000\n"); delay(10);
+  sendCmd("F3:20000\n"); delay(10);
+  sendCmd("V0:1\n"); delay(20);
+  sendCmd("p0:0\n"); delay(10); // Proportional = 0
+  sendCmd("i0:0\n"); delay(10); // Integral = 0
+  sendCmd("d0:0\n"); delay(10); // Derivative = 0
+  sendCmd("r0:0\n"); delay(10); // Setpoint = 0
+  sendCmd("C0:0\n"); delay(10); // Command = 0
+  // ================= END FIX =================
+
   delay(1000);
-  sendCmd("C0:0\n"); 
-  sendCmd("V0:1\n"); 
-  
+
   Serial.println("======================================");
   Serial.println("  O2-CONTROLLED PSV WITH PRESSURE");
   Serial.println("======================================");
@@ -319,16 +341,16 @@ String cmd = "";
 void loop() {
   // Update Staiger board data
   serial1Update(); 
-  
+
   // Update pressure sensor
   updatePressureSensor();
-  
+
   // Handle user commands
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n') {
       cmd.trim();
-      
+
       // O2 percentage command: "o2 40" sets constant flow based on 40% O2
       if (cmd.startsWith("o2 ")) {
         float o2Percent = cmd.substring(3).toFloat();
@@ -368,15 +390,11 @@ void loop() {
         Serial.println("  pressure    - Show pressure");
         Serial.println("  stop        - Stop valve");
       }
-      // Unknown command
-      else if (cmd.length() > 0) {
-        Serial.println("Unknown command. Type 'help' for commands.");
-      }
-      
+
       cmd = "";
     } else if (c != '\r') cmd += c;
   }
-  
+
   // Update control loop
   updateControl();
 }
